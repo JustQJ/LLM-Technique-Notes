@@ -1,10 +1,11 @@
 # Sparse Attention Notes
 
-本文整理三类 sparse attention / long-context attention 结构：
+本文整理四类 sparse attention / long-context attention 结构：
 
 1. 基础 DSA：DeepSeek-V3.2 / GLM-5 / GLM-5.1 的 MLA + Lightning Indexer + Sparse Attention。
 2. GLM-5.2 DSA：在基础 DSA 上加入 IndexShare / idxcache，多层复用 top-k indices。
 3. DeepSeek V4 attention：sliding window KV + HCA/CSA compressed KV。
+4. MiniMax Sparse Attention：GQA group 粒度的 blockwise sparse attention，用 Index Branch 选择 top-k KV blocks。
 
 重点关注 attention 中数据如何流动、shape 如何变化、mask 或 sparse index 如何约束可见性。
 
@@ -640,13 +641,309 @@ q7    -inf -inf -inf -inf    0    0    0    0 |    0    0
 
 ---
 
-## 4. 三类 Attention 对比
+## 4. MiniMax Sparse Attention
+
+### 核心结论
+
+MiniMax Sparse Attention（MSA）可以理解成：
+
+```text
+GQA Main Branch + lightweight Index Branch + blockwise sparse attention
+```
+
+论文：[MiniMax Sparse Attention](https://arxiv.org/abs/2606.13392)。
+
+MSA 和基础 DSA 都是先用 indexer 找重要历史位置，再让主 attention 只看被选中的内容。关键区别是：
+
+```text
+基础 DSA:
+  token-level top-k indices
+  每个 query 选择 K 个历史 token
+
+MSA:
+  block-level top-k indices
+  每个 query、每个 GQA group 选择 K 个 KV blocks
+```
+
+MSA 更偏 GPU 友好的 block sparse 设计：主 attention 仍然是精确 softmax attention，但 softmax 的可见范围被限制到被选中的 KV blocks，加上强制保留的 local block。
+
+### GQA 主路径
+
+设：
+
+```text
+B = batch
+T = query length
+S = key/value length
+H = query heads
+G = GQA groups / KV heads
+R = heads per GQA group = H / G
+D = head_dim
+M = block_size
+N = ceil(S / M)
+K = selected top-k blocks
+```
+
+主 attention 的 Q/K/V 仍按 GQA 组织：
+
+```text
+hidden_states -> q_proj -> q: [B, T, H, D]
+hidden_states -> k_proj -> k: [B, S, G, D]
+hidden_states -> v_proj -> v: [B, S, G, D]
+```
+
+按 GQA group 看：
+
+```text
+q_group: [B, T, R, D]
+k_group: [B, S, D]
+v_group: [B, S, D]
+```
+
+如果是 dense GQA attention，每个 group 内的 R 个 query heads 会看同一组 KV：
+
+```text
+scores_dense: [B, T, R, S]
+```
+
+MSA 不改变 Q/K/V 的语义，只让每个 query 在每个 GQA group 内只看被选中的 KV blocks：
+
+```text
+selected_blocks: [B, T, G, K]
+selected tokens: K * M
+scores_sparse:   [B, T, R, K * M]
+```
+
+### Index Branch
+
+Index Branch 是轻量的辅助分支，用来预测哪些 KV blocks 对当前 query 和当前 GQA group 重要。
+
+常见形状可以抽象成：
+
+```text
+index_q: [B, T, G, D_i]
+index_k: [B, S, D_i]
+```
+
+其中：
+
+- `index_q` 按 GQA group 区分，每个 group 有自己的 index query 表示。
+- `index_k` 是轻量 key 表示，可以被多个 group 共享。
+- Index Branch 只负责选择 block，不直接产生最终 attention output。
+
+token 级打分：
+
+```text
+index_scores_token = index_q @ index_k^T
+index_scores_token: [B, T, G, S]
+```
+
+聚合成 block 分数：
+
+```text
+reshape S -> N blocks * M tokens
+
+index_scores_block[b] = max(index_scores_token[j] for j in block_b and j <= query_pos)
+index_scores_block:   [B, T, G, N]
+```
+
+也就是说，一个 block 是否重要，不看 block 内 token 分数的平均值，而是看这个 block 里所有 causally visible tokens 的最大 index score。只要 block 内有一个 token 对当前 query / GQA group 很重要，这个 block 就会被认为重要。
+
+公式写法：
+
+```text
+S_idx[i, j, r] = Q_idx[i, r] · K_idx[j] / sqrt(D_i)
+
+M_idx[i, b, r] = max_{j in block_b, j <= i} S_idx[i, j, r]
+```
+
+其中：
+
+- `i` 是 query token 位置；
+- `j` 是 key/value token 位置；
+- `r` 是 GQA group；
+- `b` 是 block index；
+- 如果一个 block 内没有任何 `j <= i` 的可见 token，这个 block 分数为 `-inf`。
+
+然后按 block 分数选 top-k blocks：
+
+```text
+topk_block_indices: [B, T, G, K]
+```
+
+local block 通常会被强制保留：
+
+```text
+selected_blocks = topk(index_scores_block, K) union local_block
+```
+
+这样可以避免 indexer 漏掉当前位置附近的高频短程依赖。
+
+### 常见 Block 配置
+
+MSA 论文中的部署配置是：
+
+```text
+block_size M = 128 tokens
+K = 16 selected KV blocks
+selected token budget = K * M = 2048 tokens / query / GQA group
+```
+
+论文也比较了 `M = 32 / 64 / 128`：
+
+```text
+M = 32:
+  block 粒度更细，选择更精确，但 block 数更多，top-k / routing / metadata 开销更大。
+
+M = 64:
+  折中配置。
+
+M = 128:
+  粒度更粗，但更适合 GPU block-sparse kernel，MSA 最终采用这个量级。
+```
+
+这里的 `K = 16` 是总的 block budget，local block 包含在这个预算里，而不是额外再加一个 block。
+
+### Blockwise Sparse Attention
+
+主 attention 根据 `topk_block_indices` gather KV blocks：
+
+```text
+k:                  [B, S, G, D]
+v:                  [B, S, G, D]
+topk_block_indices: [B, T, G, K]
+```
+
+每个 block 有 M 个 token，因此 gather 后：
+
+```text
+k_sel: [B, T, G, K, M, D]
+v_sel: [B, T, G, K, M, D]
+```
+
+把 group 内的 query heads 展开：
+
+```text
+q_group: [B, T, G, R, D]
+k_sel:   [B, T, G, K * M, D]
+v_sel:   [B, T, G, K * M, D]
+```
+
+attention：
+
+```text
+scores = q_group @ k_sel^T
+scores: [B, T, G, R, K * M]
+prob:   [B, T, G, R, K * M]
+out:    [B, T, G, R, D]
+```
+
+最后 reshape 回普通 multi-head attention 输出：
+
+```text
+out -> [B, T, H, D] -> [B, T, H * D] -> o_proj
+```
+
+### 数据流图
+
+```mermaid
+flowchart TD
+    A["hidden_states<br/>[B, T, hidden]"] --> B["main q_proj<br/>q [B, T, H, D]"]
+    A --> C["main k_proj / v_proj<br/>k/v [B, S, G, D]"]
+
+    A --> D["index q proj<br/>index_q [B, T, G, Di]"]
+    A --> E["index k proj<br/>index_k [B, S, Di]"]
+
+    D --> F["Index Branch<br/>token scores [B, T, G, S]"]
+    E --> F
+    F --> G["block aggregation<br/>block scores [B, T, G, N]"]
+    G --> H["top-k + local block<br/>topk_block_indices [B, T, G, K]"]
+
+    B --> I["Blockwise Sparse Attention"]
+    C --> I
+    H --> I
+    I --> J["attn output<br/>[B, T, H, D]"]
+    J --> K2["o_proj<br/>[B, T, hidden]"]
+```
+
+### 小 Shape 示例
+
+假设：
+
+```text
+B = 1
+T = S = 16
+H = 4
+G = 2
+R = 2
+D = 4
+block_size M = 4
+N = 4 blocks
+K = 2 selected blocks
+```
+
+主 Q/K/V：
+
+```text
+q: [1, 16, 4, 4]
+k: [1, 16, 2, 4]
+v: [1, 16, 2, 4]
+```
+
+Index Branch：
+
+```text
+index_q:            [1, 16, 2, Di]
+index_k:            [1, 16, Di]
+token scores:       [1, 16, 2, 16]
+block scores:       [1, 16, 2, 4]
+topk_block_indices: [1, 16, 2, 2]
+```
+
+Sparse attention：
+
+```text
+selected tokens per query/group = K * M = 8
+scores_sparse: [1, 16, 2, 2, 8]
+out_grouped:   [1, 16, 2, 2, 4]
+out:           [1, 16, 4, 4]
+```
+
+这里 `[1, 16, 2, 2, 8]` 可以读成：
+
+```text
+[B, T, G, heads_per_group, selected_tokens]
+```
+
+也就是说，MSA 的选择粒度是 GQA group，而不是单个 query head；同一个 group 内的多个 query heads 共享 block selection，但 attention logits 和 softmax 仍按各自 query head 独立计算。
+
+### 训练和工程意义
+
+MSA 的 top-k block selection 不可导，因此训练时需要让 Index Branch 学会接近主 attention 的真实重要性分布。常见做法是：
+
+```text
+先用 full attention / dense teacher 得到参考 attention distribution
+再用 KL alignment loss 训练 Index Branch
+训练稳定后切换到 sparse attention
+```
+
+工程上，MSA 的优势不只是减少理论 FLOPs，还包括：
+
+- block 粒度选择比 token 粒度更适合 GPU sparse attention kernel；
+- GQA group 共享 block indices，减少 indexer 输出和 gather 元数据；
+- local block 强制保留，降低近邻依赖被漏掉的风险；
+- 主 attention 仍是精确 softmax，只是 softmax 的候选 KV slots 变少。
+
+---
+
+## 5. 四类 Attention 对比
 
 | 类型 | 稀疏/压缩对象 | 主 attention 看什么 | 是否拼接 KV | 是否使用 learned indexer | 复用 top-k |
 | --- | --- | --- | --- | --- | --- |
 | 基础 DSA | 原始历史 token 的 top-k indices | top-k selected original tokens | 否，gather selected K/V | 是，每层运行 | 否 |
 | GLM-5.2 DSA | 原始历史 token 的 top-k indices | top-k selected original tokens | 否，gather selected K/V | 是，但 group leader 才运行 | 是，每 4 层共享 |
 | DeepSeek V4 HCA/CSA | 压缩后的 block KV | sliding KV + compressed KV | 是，拼到 KV token 维 | CSA 有 indexer 选 compressed entries；HCA 无 | 否 |
+| MiniMax MSA | 原始历史 KV blocks 的 top-k block indices | top-k selected KV blocks + local block | 否，gather selected KV blocks | 是，Index Branch 选 blocks | GQA group 内共享 |
 
 ### 直观区别
 
@@ -672,7 +969,15 @@ DeepSeek V4：
 => 拼接后一起 softmax
 ```
 
-### Dense Attention vs 三类 Sparse Attention
+MiniMax MSA：
+
+```text
+先选 KV block indices
+=> GQA group 内共享 block selection
+=> 主 attention 只对 selected blocks + local block 做 softmax
+```
+
+### Dense Attention vs 四类 Sparse Attention
 
 ```text
 Dense causal attention:
@@ -692,11 +997,17 @@ DeepSeek V4:
   logits: [B, H, T, S_local + C]
   S_local 是 sliding window 或 prefill 中受 sliding mask 约束的 token KV
   C 是 HCA/CSA compressed KV 数量
+
+MiniMax MSA:
+  index token scores:  [B, T, G, S]
+  index block scores:  [B, T, G, N]
+  topk_block_indices:  [B, T, G, K]
+  main logits grouped: [B, T, G, R, K * M]
 ```
 
 ### 总结
 
-这三类方法都在减少长上下文 attention 的成本，但切入点不同：
+这四类方法都在减少长上下文 attention 的成本，但切入点不同：
 
 ```text
 基础 DSA:
@@ -707,7 +1018,8 @@ GLM-5.2 DSA:
 
 DeepSeek V4:
   用 sliding window 保留局部精细信息，用 compressed KV 保留长程摘要。
+
+MiniMax MSA:
+  用 learned Index Branch 选择 top-k KV blocks，在 GQA group 粒度共享稀疏选择。
 ```
-
-
 
