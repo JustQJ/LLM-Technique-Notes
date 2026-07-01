@@ -6,14 +6,26 @@
 
 ### [Sparse Attention Notes](./sparse_attention.md)
 
-梳理 sparse attention / long-context attention 的三类结构，并重点说明 attention 数据流、张量 shape 变化、mask 或 sparse index 如何约束 token 可见性。
+梳理 sparse attention / long-context attention 的四类结构，并重点说明 attention 数据流、张量 shape 变化、mask 或 sparse index 如何约束 token 可见性。
 
 主要内容：
 
 - 基础 DSA：介绍 DeepSeek-V3.2、GLM-5、GLM-5.1 中 MLA、Lightning Indexer 与 Sparse Attention 的主链路。
 - GLM-5.2 DSA：说明 IndexShare / idxcache 如何在多层之间复用 top-k indices，降低 indexer 开销。
 - DeepSeek V4 Attention：整理 sliding window KV、HCA/CSA compressed KV 和对应 mask 结构。
-- 对比总结：对 dense attention、基础 DSA、GLM-5.2 DSA 和 DeepSeek V4 attention 的可见性与工程差异做横向比较。
+- MiniMax Sparse Attention：整理 GQA group 粒度的 blockwise sparse attention、block max-pooling score 和常见 block 配置。
+- 对比总结：对 dense attention、基础 DSA、GLM-5.2 DSA、DeepSeek V4 attention 和 MiniMax MSA 的可见性与工程差异做横向比较。
+
+### [Common Numeric Data Types](./data_type.md)
+
+整理常见整数、浮点和低精度 AI 数值格式的 bit layout、数值范围、典型用途和主要取舍。
+
+主要内容：
+
+- 整数格式：介绍 `int32`、`uint32`、`int16`、`uint16`、`int8`、`uint8` 的范围和 signed / unsigned 差异。
+- 常规浮点：介绍 `float32`、`float16`、`bf16` 的 layout、动态范围、精度和训练/推理用途。
+- FP8 / FP4：整理 `E5M2`、`E4M3`、`E2M1`、Ascend `HiF8`、Ascend `HiF4` 的字段划分、范围和典型用途。
+- Block-scaled formats：介绍 `MXFP8`、`MXFP4`、`NVFP4`、`HiF4` 的 shared scale、block size 和存储开销。
 
 ### [DSA Lightning Indexer Optimization](./dsa_lightninng_indexer_optimization.md)
 
@@ -37,3 +49,5 @@
 - HISA / MISA / TISA / GVR Top-K
 - Sliding window KV / compressed KV
 - Long-context inference optimization
+- Numeric data types / quantization formats
+- FP8 / FP4 / MXFP8 / MXFP4 / NVFP4 / HiF8 / HiF4

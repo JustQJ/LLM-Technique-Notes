@@ -1,11 +1,12 @@
 # Sparse Attention Notes
 
-本文整理四类 sparse attention / long-context attention 结构：
+本文整理五类 sparse attention / long-context attention 结构：
 
 1. 基础 DSA：DeepSeek-V3.2 / GLM-5 / GLM-5.1 的 MLA + Lightning Indexer + Sparse Attention。
 2. GLM-5.2 DSA：在基础 DSA 上加入 IndexShare / idxcache，多层复用 top-k indices。
 3. DeepSeek V4 attention：sliding window KV + HCA/CSA compressed KV。
 4. MiniMax Sparse Attention：GQA group 粒度的 blockwise sparse attention，用 Index Branch 选择 top-k KV blocks。
+5. LongCat Sparse Attention：从 DSA 演进，围绕 indexer 引入 SI / CLI / HI 三类优化。
 
 重点关注 attention 中数据如何流动、shape 如何变化、mask 或 sparse index 如何约束可见性。
 
@@ -936,7 +937,162 @@ MSA 的 top-k block selection 不可导，因此训练时需要让 Index Branch 
 
 ---
 
-## 5. 四类 Attention 对比
+## 5. LongCat Sparse Attention
+
+### 核心结论
+
+LongCat Sparse Attention（LSA）可以理解成：
+
+```text
+DSA-style token sparse attention
++ lighter indexer
++ Streaming-aware Indexing
++ Cross-Layer Indexing
++ Hierarchical Indexing
+```
+
+来源：[Introducing LongCat-2.0](https://longcat.chat/blog/longcat-2.0/)。
+
+LongCat-2.0 官方介绍中把 LSA 描述为从 DeepSeek Sparse Attention（DSA）演进而来。它仍然是先用 indexer 找重要历史 token，再让主 attention 只看被选中的 token；变化重点不在主 attention 公式，而在降低 indexer 的端到端瓶颈。
+
+官方指出 DSA 的 Lightning Indexer 主要有两个工程问题：
+
+- 输出是不连续 token indices，后续 gather / HBM 访问比较碎片化；
+- index scoring 仍有二次复杂度倾向，长上下文下 indexer 自身会成为瓶颈。
+
+LSA 对 indexer 引入三项相互正交的优化：Streaming-aware Indexing（SI）、Cross-Layer Indexing（CLI）和 Hierarchical Indexing（HI）。
+
+### Streaming-aware Indexing
+
+Streaming-aware Indexing（SI）的目标是让 indexer 的 token selection 更贴近硬件访问模式。
+
+直观上，它不把全部选择预算都用于完全随机的 top-k token，而是把预算重排成：
+
+```text
+selected tokens = hardware-aligned contiguous tokens + dynamic random selected tokens
+```
+
+这样一部分原本碎片化的显存读取会变成连续、可预测的顺序读取，更容易合并 HBM access，提高有效带宽。
+
+和基础 DSA 对比：
+
+```text
+基础 DSA:
+  topk_indices: [B, T, K]
+  selected positions 通常比较离散
+
+LSA + SI:
+  selected positions 中保留一部分连续片段
+  剩余预算仍可用于动态选择远处重要 token
+```
+
+SI 主要解决的是 sparse attention 的访存效率，而不是改变 softmax attention 本身。
+
+### Cross-Layer Indexing
+
+Cross-Layer Indexing（CLI）和 GLM-5.2 的 IndexShare 思路相近：利用相邻层 attention saliency 的稳定性，让一次 indexer 结果服务多个连续层，从而摊薄 indexer 开销。
+
+官方介绍中提到：
+
+```text
+target model:
+  每两个连续层共享一次 indexing pass
+
+3-step MTP draft model:
+  Step 1 生成 index set
+  Step 2 / Step 3 复用 Step 1 的 index set
+```
+
+训练阶段会引入跨层蒸馏，让共享索引结果在多个层或多个 draft step 上仍然可用。
+
+### Hierarchical Indexing
+
+Hierarchical Indexing（HI）是粗到细的两阶段打分：
+
+```text
+stage 1: block-level approximate scoring
+         先粗召回候选 blocks
+
+stage 2: token-level fine-grained selection
+         只在召回候选里做细粒度 token 选择
+```
+
+它和 MiniMax MSA 的 block top-k 不完全相同：
+
+- MSA 的主 attention 直接看选中的 KV blocks，最终 sparse 粒度是 block；
+- LSA + HI 的 block 级打分更像 indexer 的候选召回，后面仍会在候选中选 token。
+
+因此 HI 的主要收益是缩小 indexer 每次检索要处理的候选空间。LongCat-2.0 中 HI 以 training-free / 可插拔组件形式，在部分超长上下文任务上按需启用。
+
+### 数据流
+
+抽象链路可以写成：
+
+```text
+hidden_states
+  -> main Q/K/V
+  -> lightweight indexer
+       -> optional HI coarse block recall
+       -> token scoring / token selection
+       -> optional SI contiguous + random selection layout
+       -> optional CLI reuse across layers or MTP steps
+  -> gather selected K/V
+  -> sparse attention
+  -> o_proj
+```
+
+与基础 DSA 的 shape 可以保持类似：
+
+```text
+index scores: [B, T, S]        # 或先经过 block candidate pruning
+topk_indices: [B, T, K]
+main logits:  [B, T, H, K]
+```
+
+如果启用 HI，可以抽象增加 block candidate 维度：
+
+```text
+block scores:        [B, T, N]
+candidate blocks:    [B, T, Cb]
+candidate tokens:    [B, T, Cb * M]
+token topk_indices:  [B, T, K]
+```
+
+其中：
+
+- `N = ceil(S / M)` 是历史 KV 被切成的 block 数；
+- `Cb` 是粗召回的候选 block 数；
+- `M` 是 block size；
+- `K` 是最终被主 attention 使用的 token budget。
+
+### 与 DSA / GLM-5.2 / MSA 的关系
+
+LSA 更像是在基础 DSA 上系统性优化 indexer：
+
+```text
+基础 DSA:
+  每层独立 indexer
+  token-level top-k
+  输出离散 token indices
+
+GLM-5.2 DSA:
+  多层共享 top-k indices
+  重点是减少 indexer 运行次数
+
+MiniMax MSA:
+  block-level top-k
+  主 attention 直接看 selected KV blocks
+
+LongCat LSA:
+  仍以 token sparse attention 为主
+  SI 优化 selected token 的访问形态
+  CLI 复用 indexer 结果
+  HI 用 block coarse recall 缩小 token selection 候选空间
+```
+
+---
+
+## 6. 五类 Attention 对比
 
 | 类型 | 稀疏/压缩对象 | 主 attention 看什么 | 是否拼接 KV | 是否使用 learned indexer | 复用 top-k |
 | --- | --- | --- | --- | --- | --- |
@@ -944,6 +1100,7 @@ MSA 的 top-k block selection 不可导，因此训练时需要让 Index Branch 
 | GLM-5.2 DSA | 原始历史 token 的 top-k indices | top-k selected original tokens | 否，gather selected K/V | 是，但 group leader 才运行 | 是，每 4 层共享 |
 | DeepSeek V4 HCA/CSA | 压缩后的 block KV | sliding KV + compressed KV | 是，拼到 KV token 维 | CSA 有 indexer 选 compressed entries；HCA 无 | 否 |
 | MiniMax MSA | 原始历史 KV blocks 的 top-k block indices | top-k selected KV blocks + local block | 否，gather selected KV blocks | 是，Index Branch 选 blocks | GQA group 内共享 |
+| LongCat LSA | 原始历史 token indices，HI 可先做 block 候选召回 | top-k selected original tokens；SI 尽量保留连续访问 | 否，gather selected K/V | 是，更轻量 indexer | CLI 跨层 / MTP step 共享 |
 
 ### 直观区别
 
@@ -977,7 +1134,16 @@ MiniMax MSA：
 => 主 attention 只对 selected blocks + local block 做 softmax
 ```
 
-### Dense Attention vs 四类 Sparse Attention
+LongCat LSA：
+
+```text
+先用轻量 indexer 选 token
+=> SI 把部分选择预算变成连续访问
+=> CLI 让多个层或 MTP step 复用 index set
+=> HI 可先做 block 粗召回，再在候选中选 token
+```
+
+### Dense Attention vs 五类 Sparse Attention
 
 ```text
 Dense causal attention:
@@ -1003,11 +1169,17 @@ MiniMax MSA:
   index block scores:  [B, T, G, N]
   topk_block_indices:  [B, T, G, K]
   main logits grouped: [B, T, G, R, K * M]
+
+LongCat LSA:
+  optional block scores: [B, T, N]
+  candidate blocks:      [B, T, Cb]
+  token topk_indices:    [B, T, K]
+  main logits:           [B, T, H, K]
 ```
 
 ### 总结
 
-这四类方法都在减少长上下文 attention 的成本，但切入点不同：
+这五类方法都在减少长上下文 attention 的成本，但切入点不同：
 
 ```text
 基础 DSA:
@@ -1021,5 +1193,7 @@ DeepSeek V4:
 
 MiniMax MSA:
   用 learned Index Branch 选择 top-k KV blocks，在 GQA group 粒度共享稀疏选择。
-```
 
+LongCat LSA:
+  继承 DSA 的 token sparse attention，但用 SI / CLI / HI 分别优化访存连续性、跨层复用和超长上下文候选召回。
+```
