@@ -354,6 +354,401 @@ real_value[j] = E8M0_scale * fp4_e2m1_value[j]
 - 每 32 个元素共享同一个 scale，block 内数值分布差异大时量化误差会变大。
 - 常用于极低 bit 权重、activation 或训练/推理研究。
 
+### MXFP4 元素格式：FP4 E2M1 二进制与数值对应
+
+MXFP4 的元素使用 FP4 E2M1 格式：
+
+```text
+FP4 E2M1 = 1 sign + 2 exponent + 1 mantissa
+```
+
+前面这个公式：
+
+```text
+value = (-1)^S × (1 + M / 2) × 2^(E - bias)
+```
+
+只适用于 **normal number**，也就是：
+
+```text
+E != 00
+```
+
+对于 E2M1 来说，`E=00` 是特殊区间，用来表示：
+
+```text
+0 和 subnormal 数
+```
+
+#### 1. normal 区间：E 不是 00
+
+E2M1 中：
+
+```text
+S: 1 bit
+E: 2 bit
+M: 1 bit
+bias = 1
+```
+
+当 `E != 00` 时，用 normal 公式：
+
+```text
+value = (-1)^S × (1 + M / 2) × 2^(E - 1)
+```
+
+例如正数：
+
+| E    |  M | 计算              |     值 |
+| ---- | -: | --------------- | ----: |
+| `01` |  0 | `1.0 × 2^(1-1)` | `1.0` |
+| `01` |  1 | `1.5 × 2^(1-1)` | `1.5` |
+| `10` |  0 | `1.0 × 2^(2-1)` | `2.0` |
+| `10` |  1 | `1.5 × 2^(2-1)` | `3.0` |
+| `11` |  0 | `1.0 × 2^(3-1)` | `4.0` |
+| `11` |  1 | `1.5 × 2^(3-1)` | `6.0` |
+
+所以 normal 区间得到：
+
+```text
+1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+```
+
+#### 2. special/subnormal 区间：E = 00
+
+当：
+
+```text
+E = 00
+```
+
+不能再用：
+
+```text
+1 + M / 2
+```
+
+而是用 subnormal 逻辑：
+
+```text
+value = (-1)^S × (M / 2) × 2^(1 - bias)
+```
+
+E2M1 里 `bias = 1`，所以：
+
+```text
+2^(1 - bias) = 2^(1 - 1) = 1
+```
+
+因此：
+
+```text
+value = (-1)^S × (M / 2)
+```
+
+所以：
+
+| E    |  M | 计算      |     值 |
+| ---- | -: | ------- | ----: |
+| `00` |  0 | `0 / 2` | `0.0` |
+| `00` |  1 | `1 / 2` | `0.5` |
+
+也就是：
+
+```text
+E=00, M=0 → 0
+E=00, M=1 → 0.5
+```
+
+#### 3. 如果错误地用 normal 公式会怎样？
+
+如果对 `E=00` 也硬套 normal 公式：
+
+```text
+value = (1 + M / 2) × 2^(E - 1)
+```
+
+那么：
+
+##### `E=00, M=0`
+
+```text
+(1 + 0/2) × 2^(0-1)
+= 1 × 0.5
+= 0.5
+```
+
+但真实应该是：
+
+```text
+0.0
+```
+
+##### `E=00, M=1`
+
+```text
+(1 + 1/2) × 2^(0-1)
+= 1.5 × 0.5
+= 0.75
+```
+
+但真实应该是：
+
+```text
+0.5
+```
+
+所以 `E=00` 必须特殊处理。
+
+#### 4. E2M1 完整正数表
+
+| bits   | E    |  M | 类型        |     值 |
+| ------ | ---- | -: | --------- | ----: |
+| `0000` | `00` |  0 | zero      | `0.0` |
+| `0001` | `00` |  1 | subnormal | `0.5` |
+| `0010` | `01` |  0 | normal    | `1.0` |
+| `0011` | `01` |  1 | normal    | `1.5` |
+| `0100` | `10` |  0 | normal    | `2.0` |
+| `0101` | `10` |  1 | normal    | `3.0` |
+| `0110` | `11` |  0 | normal    | `4.0` |
+| `0111` | `11` |  1 | normal    | `6.0` |
+
+加上符号位后，E2M1 的完整可表示值集合为：
+
+```text
+0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0
+```
+
+#### 5. 对应到量化代码
+
+典型 MXFP4 量化代码没有真的编码 `E` 和 `M`，而是在数值上模拟这个集合：
+
+```python
+private_exp = torch.floor(torch.log2(x.abs().clamp(min=_MXFP4_EPSILON))).clamp(min=0.0)
+```
+
+把小于 `1` 的数也强制放到 `private_exp = 0` 这个区间。
+
+然后：
+
+```python
+x = x * 2
+x = round(x)
+x = x * 0.5
+```
+
+就可以产生：
+
+```text
+0 和 0.5
+```
+
+例如：
+
+```text
+x = 0.2
+x * 2 = 0.4
+round(0.4) = 0
+0 * 0.5 = 0.0
+```
+
+```text
+x = 0.3
+x * 2 = 0.6
+round(0.6) = 1
+1 * 0.5 = 0.5
+```
+
+所以是的：**`0` 和 `0.5` 是 E2M1 的 zero/subnormal 特殊值，不走 normal 浮点公式。**
+
+#### 6. MXFP4 伪量化参考实现（PyTorch）
+
+下面给出完整的 MXFP4 pseudo-quantization 参考实现，对每行代码添加详细注释，帮助理解量化 → 反量化的完整流程：
+
+```python
+# ============================================================
+# MXFP4 常量定义
+# ============================================================
+
+# E2M1 格式的 exponent bits 数（2 bit exponent）
+_MXFP4_EBITS = 2
+
+# E2M1 格式的 mantissa bits 数（1 bit mantissa）+ 1 bit implicit leading
+# 这里 _MXFP4_MBITS = 3 是量化算法内部使用的"有效精度"参数，
+# 实际 E2M1 只有 1 bit 显式 mantissa，但量化时用 3 bit 精度做中间计算
+_MXFP4_MBITS = 3
+
+# E2M1 的最大 exponent 值（2 bit exponent 能表示的最大值是 3，
+# 但 E=11 是最大 normal 区间，_EMAX=2 用于 scale 计算中的归一化因子）
+_MXFP4_EMAX = 2
+
+# E2M1 能表示的最大 finite 值：
+# S=0, E=11, M=1 → (1 + 1/2) × 2^(3-1) = 1.5 × 4 = 6.0
+_MXFP4_MAX_NORM = 6.0
+
+# MXFP4 block 大小：32 个元素共享一个 E8M0 scale
+_MXFP4_BLOCK_SIZE = 32
+
+# private_exp 的下限，确保小于 1 的数被强制归入 E=00 区间
+# 这样它们会走 subnormal/zero 逻辑，产生 0 或 0.5
+_MXFP4_MIN_EXP = 0.0
+
+# 量化时的缩放因子：将数值放大 2 倍后取整
+# 目的是让 [1, 2) 区间的数映射到 [2, 4)，round 后得到 2 或 3
+# 再乘以 INV_SCALE_FACTOR 就得到 1.0 或 1.5
+_MXFP4_SCALE_FACTOR = 2.0
+
+# 反量化时的缩放因子：取整后缩小 2 倍，恢复为 E2M1 可表示值
+_MXFP4_INV_SCALE_FACTOR = 0.5
+
+# 防止 log2(0) 出现 -inf 的最小值，接近 FP32 最小 positive subnormal
+_MXFP4_EPSILON = 1.17e-38
+
+# E8M0 scale 的最大 exponent 值（8 bit unsigned，bias=127，最大 127）
+_E8M0_SCALE_EMAX = 127
+
+
+def _mxfp4_quant_tf(x, qdim, stochastic_rounding=False):
+    """MXFP4-C7 quantization → dequantized (recovered) tensor.
+
+    实现参考 triton to_mxfp4c7(p_cx=7)：
+    shared_exp = ceil(log2(max_val / 7))。
+    其中 p_cx=7 是 MXFP4 的归一化常数，用于确定 shared exponent。
+
+    参数：
+      x: 输入张量（待量化）
+      qdim: 量化维度，block 沿此维度划分
+      stochastic_rounding: 是否使用随机舍入（训练时减少偏差）
+
+    返回：
+      recovered: 反量化后的张量（shape 与输入相同）
+    """
+    # 保存输入张量的维度数，用于后续处理负数维度索引
+    ndim = x.ndim
+
+    # 保存原始 shape，最后需要 reshape 回去
+    orig_shape = x.shape
+
+    # 将负数维度索引转换为正数索引，便于后续计算
+    # 例如 qdim=-1 在 3D 张量中变为 2
+    normalized_qdim = qdim if qdim >= 0 else ndim + qdim
+
+    # reduction_dim 是用于计算 block 内 max 的维度
+    # unflatten 后新增的 block 内维度，需要在此维度上求 amax
+    reduction_dim = normalized_qdim + 1
+
+    # 将 qdim 维度拆分为 (-1, BLOCK_SIZE)，形成 block 结构
+    # 例如 shape (M, K) 且 qdim=-1 → (M, K//32, 32)
+    x = x.unflatten(qdim, (-1, _MXFP4_BLOCK_SIZE))
+
+    # ============================================================
+    # 第一步：计算 shared exponent（E8M0 scale）
+    # ============================================================
+
+    # 求 block 内每个元素的绝对值的最大值
+    # shape: (..., num_blocks, 1)，keepdim=True 便于广播
+    max_val = torch.amax(x.abs(), reduction_dim, keepdim=True)
+
+    # MXFP4-C7 的归一化常数：将 max_val 除以 7 后再取 log2
+    # 除以 7 是为了留出 headroom，确保量化后的值不会溢出 E2M1 的表示范围
+    inv_constant = 1 / 7
+
+    # 计算 shared exponent：
+    # shared_exp = ceil(log2(max_val / 7))
+    # 这样 scale = 2^shared_exp 能保证 block 内最大值的量化结果 ≤ E2M1_MAX
+    shared_exp = torch.ceil(torch.log2(max_val.clamp(min=_MXFP4_EPSILON) * inv_constant))
+
+    # 将 shared exponent 限制在 E8M0 的表示范围内 [-127, 127]
+    # E8M0 使用 8 bit unsigned，bias=127，有效范围 [0, 254] → [-127, 127]
+    shared_exp = shared_exp.clamp(-127, 127)
+
+    # ============================================================
+    # 第二步：用 shared exponent 归一化，将数值缩放到 E2M1 可表示范围
+    # ============================================================
+
+    # 除以 scale（即乘以 2^(-shared_exp)），使 block 内数值落入 [-6, 6]
+    # 这是 E2M1 能表示的 finite 范围
+    x = x * torch.exp2(-shared_exp)
+
+    # ============================================================
+    # 第三步：计算 private exponent（模拟 E2M1 的 exponent 编码）
+    # ============================================================
+
+    # 对每个元素计算其"私有" exponent：
+    # floor(log2(|x|)) 得到该元素在 E2M1 中应有的 exponent E
+    # clamp(min=0) 确保小于 1 的数被强制归入 E=00 区间
+    # 这些数会走 subnormal/zero 逻辑，最终量化为 0 或 0.5
+    private_exp = torch.floor(torch.log2(x.abs().clamp(min=_MXFP4_EPSILON))).clamp(min=_MXFP4_MIN_EXP)
+
+    # ============================================================
+    # 第四步：去除 exponent，只保留 mantissa 部分，然后取整
+    # ============================================================
+
+    # 除以 2^private_exp，将数值归一化到 [1, 2) 区间（normal 数）
+    # 或 [0, 1) 区间（subnormal/zero）
+    # 然后乘以 SCALE_FACTOR=2，将 [1, 2) 映射到 [2, 4)
+    # 乘以 SCALE_FACTOR 是为了将尾数第一位提到整数，避免round的时候消除掉
+    x = x * torch.exp2(-private_exp) * _MXFP4_SCALE_FACTOR
+
+    if stochastic_rounding:
+        # 随机舍入：加上 [0, 1) 均匀分布随机数后向下取整
+        # 期望上无偏，训练时减少量化偏差累积
+        x.add_(torch.rand_like(x)).floor_()
+    else:
+        # 确定性舍入（round-to-nearest）：
+        # 1. 取符号位，后续对绝对值操作
+        x_sign = torch.sign(x)
+        # 2. 对绝对值加 0.5 后向下取整，实现四舍五入
+        #    例如 2.3 + 0.5 = 2.8 → floor = 2
+        #    例如 2.6 + 0.5 = 3.1 → floor = 3
+        x = x_sign * torch.floor_(x.abs() + 0.5)
+
+    # ============================================================
+    # 第五步：反量化，恢复为 E2M1 可表示的数值
+    # ============================================================
+
+    # 1. 乘以 INV_SCALE_FACTOR=0.5，将取整后的值映射回 E2M1 的 mantissa
+    #    例如 round 后为 2 → 2 * 0.5 = 1.0
+    #    例如 round 后为 3 → 3 * 0.5 = 1.5
+    # 2. 乘以 2^private_exp，恢复 exponent
+    # 3. clamp 确保结果在 E2M1 的 finite 范围 [-6, 6] 内
+    x = (x * _MXFP4_INV_SCALE_FACTOR * torch.exp2(private_exp)).clamp(-_MXFP4_MAX_NORM, _MXFP4_MAX_NORM)
+
+    # ============================================================
+    # 第六步：乘以 shared scale，恢复原始数值量级
+    # ============================================================
+
+    # 乘以 2^shared_exp，将量化后的值恢复到原始数值范围
+    recovered = x * torch.exp2(shared_exp)
+
+    # 将 shape 恢复为原始输入 shape
+    return recovered.reshape(orig_shape)
+```
+
+**量化流程总结：**
+
+```text
+原始值 x
+  │
+  ├─ 1. 按 block 求 max_val
+  ├─ 2. 计算 shared_exp = ceil(log2(max_val / 7))
+  ├─ 3. x / 2^shared_exp → 归一化到 [-6, 6]
+  │
+  ├─ 4. 计算 private_exp = floor(log2(|x|)), min=0
+  ├─ 5. x / 2^private_exp × 2 → 归一化到 [2, 4) 或 [0, 2)
+  ├─ 6. round → 整数
+  ├─ 7. × 0.5 × 2^private_exp → E2M1 可表示值
+  │
+  └─ 8. × 2^shared_exp → 恢复原始量级
+```
+
+**关键理解：**
+
+- `private_exp = 0` 对应 E2M1 的 `E=00` 区间，产生 `0` 或 `0.5`
+- `private_exp = 1` 对应 `E=01`，产生 `1.0` 或 `1.5`
+- `private_exp = 2` 对应 `E=10`，产生 `2.0` 或 `3.0`
+- `private_exp = 3` 对应 `E=11`，产生 `4.0` 或 `6.0`
+
 ---
 
 ## 9. NVFP4
