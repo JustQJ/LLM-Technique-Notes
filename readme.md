@@ -24,8 +24,8 @@
 
 - 整数格式：介绍 `int32`、`uint32`、`int16`、`uint16`、`int8`、`uint8` 的范围和 signed / unsigned 差异。
 - 常规浮点：介绍 `float32`、`float16`、`bf16` 的 layout、动态范围、精度和训练/推理用途。
-- FP8 / FP4：整理 `E5M2`、`E4M3`、`E2M1`、Ascend `HiF8`、Ascend `HiF4` 的字段划分、范围和典型用途。
-- Block-scaled formats：介绍 `MXFP8`、`MXFP4`、`NVFP4`、`HiF4` 的 shared scale、block size 和存储开销。
+- FP8 / FP6 / FP4：整理 `E5M2`、`E4M3`、`E2M3`、`E3M2`、`E2M1`、Ascend `HiF8`、Ascend `HiF4` 的字段划分、范围和典型用途。
+- Block-scaled formats：介绍 `MXFP8`、`MXFP6`、`MXFP4`、`NVFP4`、`HiF4` 的 shared scale、block size 和存储开销。
 
 ### [DSA Lightning Indexer Optimization](./dsa_lightninng_indexer_optimization.md)
 
@@ -50,4 +50,4 @@
 - Sliding window KV / compressed KV
 - Long-context inference optimization
 - Numeric data types / quantization formats
-- FP8 / FP4 / MXFP8 / MXFP4 / NVFP4 / HiF8 / HiF4
+- FP8 / FP6 / FP4 / MXFP8 / MXFP6 / MXFP4 / NVFP4 / HiF8 / HiF4
