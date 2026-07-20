@@ -27,6 +27,18 @@
 - FP8 / FP6 / FP4：整理 `E5M2`、`E4M3`、`E2M3`、`E3M2`、`E2M1`、Ascend `HiF8`、Ascend `HiF4` 的字段划分、范围和典型用途。
 - Block-scaled formats：介绍 `MXFP8`、`MXFP6`、`MXFP4`、`NVFP4`、`HiF4` 的 shared scale、block size 和存储开销。
 
+### [LLM Quantization Notes](./quant_note.md)
+
+系统整理大语言模型量化的工程原理与实际推理路径，重点区分模型容量、访存带宽、算子计算和端到端性能收益。
+
+主要内容：
+
+- LLM 量化的动机，以及权重、激活和 KV Cache 的资源瓶颈。
+- 常见低精度格式、量化参数、粒度、对称性与静态/动态量化。
+- Weight-only、W8A8、W4A8、W4A4 和 KV Cache 量化的计算路径。
+- GPTQ、AWQ、SmoothQuant 等常见算法的目标与取舍。
+- 量化工具链、硬件算子支持，以及容量收益与真实加速的区别。
+
 ### [DSA Lightning Indexer Optimization](./dsa_lightninng_indexer_optimization.md)
 
 围绕 DSA indexer 的性能瓶颈，整理现有论文方法、优化轴和可落地的工程路线，重点关注如何减少 indexer score computation、降低 top-k selector 开销以及在速度和精度之间取舍。
@@ -38,6 +50,19 @@
 - 方法对比：按 layer、token/block、head、decode time、top-k selector 等优化轴进行对照。
 - 进一步优化：提出 Top-M IndexCache、Full/Rerank/Reuse 三类层策略、距离自适应 top-m、IndexCache + TISA、Cross-layer GVR 等组合方案。
 - 工程路线：给出从 profile、基础 IndexCache、Top-M IndexCache 到 TISA-lite 和 GVR 的分阶段落地建议。
+
+### [Split-KV Attention：Online Softmax 与 LSE Reduce](./split_kv_online_softmax_lse_reduce.md)
+
+说明 Split-KV Attention 为什么能在保持数学等价的前提下并行处理多个 KV 分片，以及分片内 Online Softmax 和分片间 LSE Reduce 的统一原理。
+
+主要内容：
+
+- Split-KV 的分区可加性与全局 attention 重建公式。
+- Online Softmax 的 `(m, l, acc)` 状态及稳定合并方法。
+- `LSE = m + log(l)` 的来源与局部 softmax 总质量的含义。
+- 使用 LSE 加权合并局部输出的方法，以及不能等权平均的原因。
+- PV 后 rescale 的线性依据、正确性条件和有限精度边界。
+- 对应 kernel 计算顺序的纯 PyTorch 两阶段参考实现。
 
 ## 主题索引
 
@@ -51,3 +76,5 @@
 - Long-context inference optimization
 - Numeric data types / quantization formats
 - FP8 / FP6 / FP4 / MXFP8 / MXFP6 / MXFP4 / NVFP4 / HiF8 / HiF4
+- LLM quantization / Weight-only / W8A8 / W4A4 / KV Cache quantization
+- Split-KV / Online Softmax / Log-Sum-Exp Reduce
